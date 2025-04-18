@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # install_friendgpt.sh — deploys ONE customised GPT chatbot instance
+# This version enforces a stable Flask Secret Key for better security.
+# If one is not provided interactively, the script generates one and saves it in .env.
+# In app.py, we remove fallback generation; the service fails if FLASK_SECRET_KEY is missing.
+
 set -euo pipefail
 
 ### 0. Require root
@@ -10,15 +14,20 @@ set -euo pipefail
 read -rp "➡  Bot instance name (e.g. eligpt): "            INSTANCE
 read -rp "➡  Domain for this bot (e.g. eli.example.com): " DOMAIN
 read -rp "➡  Linux user to run the service (create if new): " APPUSER
+
+# Prompt for API key
 read -rsp "➡  OpenAI API key: " OPENAI_API_KEY; echo
-read -rp "➡  Password visitors must enter: "                BOT_PASSWORD
+
+# Prompt for visitor password
+read -rp "➡  Password visitors must enter: " BOT_PASSWORD
+
 echo "➡  Paste your SYSTEM PROMPT (single line; use \\n for breaks):"
 read -r SYSTEM_PROMPT
 
-# NEW: Prompt or generate a Flask secret key
+# Prompt or generate a Flask secret key
 read -rp "➡  Flask Secret Key (leave empty to generate): " FLASK_SECRET_KEY
 if [[ -z "$FLASK_SECRET_KEY" ]]; then
-  # We’ll generate a 32‐char hex key using openssl if none given
+  # Generate a 32‐char hex key using openssl if none given
   FLASK_SECRET_KEY=$(openssl rand -hex 16)
   echo "   (No key provided, generated one automatically.)"
 fi
@@ -28,22 +37,24 @@ read -rp "➡  Auto‑assign HTTP port? [Y/n]: " AUTO_PORT
 if [[ "${AUTO_PORT,,}" == "n" ]]; then
   read -rp "➡  Port for Gunicorn (e.g. 5050): " PORT
 else
-  while :; do   # pick free port 5000‑5999 at random
-    C=$((5000 + RANDOM % 1000))
+  while :; do
+    C=$((5000 + RANDOM % 1000))  # pick a free port 5000‑5999 at random
     ss -ltn | awk '{print $4}' | grep -q ":${C}$" || { PORT=$C; break; }
   done
 fi
 
 # Optional TLS
 read -rp "➡  Issue HTTPS cert with Let's Encrypt now? [Y/n]: " WANT_TLS
-[[ "${WANT_TLS,,}" != "n" ]] && read -rp "➡  Email for TLS notices: " CERTMAIL
+if [[ "${WANT_TLS,,}" != "n" ]]; then
+  read -rp "➡  Email for TLS notices: " CERTMAIL
+fi
 
 ### 2. Variables
 PROJECT_DIR="/home/${APPUSER}/${INSTANCE}"
 SERVICE_FILE="/etc/systemd/system/${INSTANCE}.service"
 NGINX_FILE="/etc/nginx/sites-available/${INSTANCE}"
 ENV_FILE="${PROJECT_DIR}/.env"
-PY_BIN=$(command -v python3)  # absolute path to python3
+PY_BIN=$(command -v python3)
 
 ### 3. Ensure user exists
 id -u "$APPUSER" &>/dev/null || adduser --disabled-password --gecos "" "$APPUSER"
@@ -68,19 +79,21 @@ openai>=1.0.0
 python-dotenv
 REQ
 
+# Securely store environment variables
 cat > "$ENV_FILE" <<ENV
 OPENAI_API_KEY="${OPENAI_API_KEY}"
 BOT_PASSWORD="${BOT_PASSWORD}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT}"
 FLASK_SECRET_KEY="${FLASK_SECRET_KEY}"
 ENV
+
 chmod 600 "$ENV_FILE"
 chown "${APPUSER}:${APPUSER}" "$ENV_FILE"
 
 ### 7. app.py
+# The Flask secret key is REQUIRED from .env. If not set, the app will fail to start
 cat > "${PROJECT_DIR}/app.py" <<'PY'
 import os
-import secrets
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -89,8 +102,10 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# We either use the FLASK_SECRET_KEY from .env or generate a fallback
-app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(16)
+flask_secret_key = os.getenv("FLASK_SECRET_KEY")
+if not flask_secret_key:
+    raise RuntimeError("FLASK_SECRET_KEY not set in environment. Aborting for security.")
+app.secret_key = flask_secret_key
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 PASSWORD = os.getenv("BOT_PASSWORD")
